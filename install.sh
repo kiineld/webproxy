@@ -211,14 +211,20 @@ else
     success "DNS в порядке: $DOMAIN -> $DOMAIN_IP"
 fi
 
+caddy_running=""
 for port in 80 443; do
     holder="$(ss -lntpH "sport = :$port" 2>/dev/null | sed -nE 's/.*users:\(\("([^"]+)".*/\1/p' | head -n1 || true)"
     if [[ -n "$holder" && "$holder" != "caddy" ]]; then
         error "Порт $port уже занят процессом «$holder» (nginx/apache?).
        Остановите его: systemctl disable --now $holder"
     fi
+    [[ "$holder" == "caddy" ]] && caddy_running=1
 done
-success "Порты 80/443 свободны"
+if [[ -n "$caddy_running" ]]; then
+    info "Порты 80/443 держит Caddy от предыдущей установки — он будет перенастроен."
+else
+    success "Порты 80/443 свободны"
+fi
 
 #------------------------------------------------------------------------------
 # Исходники официального релея
@@ -233,7 +239,23 @@ else
     rm -rf "$SRC_DIR"
     git clone --depth 1 "$UPSTREAM_REPO" "$SRC_DIR"
 fi
-[[ -x "$SRC_DIR/deploy/install.sh" ]] || chmod +x "$SRC_DIR/deploy/install.sh" "$SRC_DIR/deploy/install-mtproxy.sh"
+chmod +x "$SRC_DIR/deploy/install.sh" "$SRC_DIR/deploy/install-mtproxy.sh"
+
+# Обходной путь для бага апстрима: deploy/install.sh выставляет `umask 077`, а затем
+# запускает `go test ./...`. Тест TestLoadAcceptsSystemdCredentialReadPermissions создаёт
+# profiles.json с режимом 0444 и ждёт, что Load его отвергнет как доступный на чтение
+# группе и остальным. Под umask 077 файл получает режим 0400, Load его принимает,
+# и тест падает — установка обрывается на исправном сервере.
+# Прогоняем тесты под umask 022; на создание файлов установщиком это не влияет.
+if grep -qE '^\(cd .* test \./\.\.\.\)$' "$SRC_DIR/deploy/install.sh"; then
+    sed -i -E 's|^\(cd .* test \./\.\.\.\)$|(umask 022; &)|' "$SRC_DIR/deploy/install.sh"
+    grep -q 'umask 022; (cd' "$SRC_DIR/deploy/install.sh" ||
+        error "Не удалось применить обходной путь для тестов апстрима"
+    success "Применён обходной путь для umask в тестах апстрима"
+else
+    warn "Строка запуска тестов апстрима не найдена — обходной путь не нужен или формат изменился."
+fi
+
 success "Исходники: $SRC_DIR ($(git -C "$SRC_DIR" rev-parse --short HEAD))"
 
 #------------------------------------------------------------------------------
@@ -394,6 +416,11 @@ printf '%s\n' "$SECRET" | "$SRC_DIR/deploy/install.sh" \
 # Проверка результата
 #------------------------------------------------------------------------------
 step "Проверка сервисов..."
+
+# Апстрим делает `enable --now` для релея, что не перезапускает уже работающий
+# процесс от прошлой установки — он остался бы со старым бинарником и конфигом.
+systemctl try-restart tproxy-server.service || true
+
 failed=()
 for unit in tproxy-firewall mtproxy tproxy-server caddy; do
     if systemctl is-active --quiet "$unit"; then

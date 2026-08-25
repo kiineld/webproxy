@@ -256,6 +256,33 @@ else
     warn "Строка запуска тестов апстрима не найдена — обходной путь не нужен или формат изменился."
 fi
 
+# Тот же баг во второй раз: install-mtproxy.sh наследует `umask 077` от deploy/install.sh,
+# поэтому make создаёт objs/, objs/bin/ и сам бинарник с режимом 0700. Дерево затем
+# отдаётся root:root, а юнит запускает mtproto-proxy от пользователя mtproxy — тот не может
+# войти в каталог и systemd сообщает 203/EXEC. Собираем под umask 022.
+if grep -q '^umask 022$' "$SRC_DIR/deploy/install-mtproxy.sh"; then
+    :
+elif grep -q '^set -euo pipefail$' "$SRC_DIR/deploy/install-mtproxy.sh"; then
+    sed -i '/^set -euo pipefail$/a umask 022' "$SRC_DIR/deploy/install-mtproxy.sh"
+    grep -q '^umask 022$' "$SRC_DIR/deploy/install-mtproxy.sh" ||
+        error "Не удалось применить обходной путь для umask при сборке MTProxy"
+    success "Применён обходной путь для umask при сборке MTProxy"
+else
+    warn "Формат install-mtproxy.sh изменился — обходной путь для umask не применён."
+fi
+
+# Установщик пропускает пересборку, если бинарник уже на месте, поэтому дерево,
+# собранное прошлым запуском под umask 077, надо починить отдельно.
+if [[ -d /opt/MTProxy ]]; then
+    chmod -R a+rX /opt/MTProxy
+    if [[ -x /opt/MTProxy/objs/bin/mtproto-proxy ]] && id -u mtproxy >/dev/null 2>&1; then
+        runuser -u mtproxy -- test -x /opt/MTProxy/objs/bin/mtproto-proxy ||
+            error "Пользователь mtproxy не может запустить /opt/MTProxy/objs/bin/mtproto-proxy.
+       Удалите каталог и запустите скрипт заново: rm -rf /opt/MTProxy"
+    fi
+    success "Права на /opt/MTProxy нормализованы"
+fi
+
 success "Исходники: $SRC_DIR ($(git -C "$SRC_DIR" rev-parse --short HEAD))"
 
 #------------------------------------------------------------------------------

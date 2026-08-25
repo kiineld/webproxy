@@ -275,12 +275,16 @@ fi
 # собранное прошлым запуском под umask 077, надо починить отдельно.
 if [[ -d /opt/MTProxy ]]; then
     chmod -R a+rX /opt/MTProxy
-    if [[ -x /opt/MTProxy/objs/bin/mtproto-proxy ]] && id -u mtproxy >/dev/null 2>&1; then
-        runuser -u mtproxy -- test -x /opt/MTProxy/objs/bin/mtproto-proxy ||
-            error "Пользователь mtproxy не может запустить /opt/MTProxy/objs/bin/mtproto-proxy.
-       Удалите каталог и запустите скрипт заново: rm -rf /opt/MTProxy"
+    if id -u mtproxy >/dev/null 2>&1 &&
+       ! runuser -u mtproxy -- test -x /opt/MTProxy/objs/bin/mtproto-proxy; then
+        warn "Пользователь mtproxy всё ещё не может запустить mtproto-proxy."
+        warn "Удаляем /opt/MTProxy — установщик пересоберёт его под корректным umask."
+        ls -ld /opt/MTProxy /opt/MTProxy/objs /opt/MTProxy/objs/bin \
+               /opt/MTProxy/objs/bin/mtproto-proxy 2>&1 | sed 's/^/    /' || true
+        rm -rf /opt/MTProxy
+    else
+        success "Права на /opt/MTProxy в порядке"
     fi
-    success "Права на /opt/MTProxy нормализованы"
 fi
 
 success "Исходники: $SRC_DIR ($(git -C "$SRC_DIR" rev-parse --short HEAD))"

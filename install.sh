@@ -23,9 +23,17 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 UPSTREAM_REPO="https://github.com/telegramdesktop/tproxy-server.git"
+# Апстрим закреплён на проверенном коммите: прошлая версия брала HEAD, и когда апстрим
+# по умолчанию включил base path и точные маршруты сайта, скрипт молча перестал работать.
+# Переопределить: TPROXY_REF=<коммит|ветка> bash install.sh ...
+UPSTREAM_REF="${TPROXY_REF:-c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8}"
 SRC_DIR=/opt/tproxy-server-src
 INFO_FILE=/root/telegram_webproxy_info.txt
 SITE_DIR_DEFAULT=/srv/tproxy-site
+# Рекламный тег (proxy tag) от @MTProxybot, передаётся в MTProxy как `-P <тег>`.
+# Отключить: --ad-tag none
+AD_TAG_DEFAULT=2e99d97081ce651f5a42da2ec7bdb004
+AD_TAG_FILE=/etc/mtproxy/ad-tag.env
 
 step()    { echo -e "\n${YELLOW}========================================\n$1\n========================================${RESET}"; }
 success() { echo -e "${GREEN}[+] $1${RESET}"; }
@@ -78,6 +86,9 @@ SECRET="${SECRET:-}"
 SITE_DIR=""
 SITE_UPSTREAM=""
 FORCE_SITE=""
+BASE_PATH=""
+STATIC_ROUTES=""
+AD_TAG="${AD_TAG:-}"
 WORKERS="${WORKERS:-1}"
 MAX_CONNECTIONS="${MAX_CONNECTIONS:-4096}"
 
@@ -93,6 +104,13 @@ usage() {
   --site-upstream URL     вместо статики проксировать локальное приложение, напр. http://127.0.0.1:3000
   --force-site            перегенерировать сайт-заглушку, даже если он уже установлен
                           (прежний каталог сохраняется рядом с меткой времени)
+  --static-routes MODE    exact (ссылки /about.html) или legacy (ещё и /about);
+                          по умолчанию определяется по ссылкам сайта
+  --base-path SLUG|none   путь, под которым работает прокси; none — корень домена.
+                          По умолчанию: новая установка получает случайный путь,
+                          повторная сохраняет прежний
+  --ad-tag HEX|none       рекламный тег от @MTProxybot (32 hex); none — отключить.
+                          По умолчанию: прежний тег или $AD_TAG_DEFAULT
   --workers N             воркеров MTProxy (по умолчанию 1)
   --max-connections N     соединений на воркер (по умолчанию 4096)
 USAGE
@@ -106,6 +124,9 @@ while [[ $# -gt 0 ]]; do
         --site-dir)        SITE_DIR="${2:-}"; shift 2 ;;
         --site-upstream)   SITE_UPSTREAM="${2:-}"; shift 2 ;;
         --force-site)      FORCE_SITE=1; shift ;;
+        --static-routes)   STATIC_ROUTES="${2:-}"; shift 2 ;;
+        --base-path)       BASE_PATH="${2:-}"; shift 2 ;;
+        --ad-tag)          AD_TAG="${2:-}"; shift 2 ;;
         --workers)         WORKERS="${2:-}"; shift 2 ;;
         --max-connections) MAX_CONNECTIONS="${2:-}"; shift 2 ;;
         -h|--help)         usage ;;
@@ -167,7 +188,7 @@ fi
 # Секрет: переиспользуем существующий, чтобы повторный запуск был безопасен
 #------------------------------------------------------------------------------
 if [[ -z "$SECRET" && -f /etc/tproxy-server/profiles.json ]]; then
-    SECRET="$(sed -nE 's/.*"secret"[[:space:]]*:[[:space:]]*"([0-9a-f]{32})".*/\1/p' \
+    SECRET="$(sed -nE 's/.*"secret"[[:space:]]*:[[:space:]]*"((dd)?[0-9a-f]{32})".*/\1/p' \
         /etc/tproxy-server/profiles.json | head -n1)"
     [[ -n "$SECRET" ]] && info "Найдена предыдущая установка — секрет переиспользован."
 fi
@@ -182,9 +203,41 @@ fi
 if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ ]];         then error "--workers должен быть положительным числом"; fi
 if [[ ! "$MAX_CONNECTIONS" =~ ^[1-9][0-9]*$ ]]; then error "--max-connections должен быть положительным числом"; fi
 
+if [[ -n "$STATIC_ROUTES" && "$STATIC_ROUTES" != exact && "$STATIC_ROUTES" != legacy ]]; then
+    error "--static-routes должен быть exact или legacy"
+fi
+# Тот же синтаксис, что проверяет апстрим (BASE_PATH.md §1); путь чувствителен к регистру.
+BASE_PATH="${BASE_PATH#/}"; BASE_PATH="${BASE_PATH%/}"
+if [[ -n "$BASE_PATH" && "$BASE_PATH" != none ]] &&
+   { [[ ! "$BASE_PATH" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*$ ]] || [[ ${#BASE_PATH} -gt 128 ]]; }; then
+    error "--base-path: сегменты [A-Za-z0-9][A-Za-z0-9_-]* через /, не длиннее 128 символов, или none"
+fi
+
+#------------------------------------------------------------------------------
+# Рекламный тег: явный --ad-tag > сохранённый выбор > тег по умолчанию
+#------------------------------------------------------------------------------
+AD_TAG="$(printf '%s' "$AD_TAG" | tr '[:upper:]' '[:lower:]')"
+if [[ -z "$AD_TAG" ]]; then
+    if [[ -f "$AD_TAG_FILE" ]]; then
+        AD_TAG="$(sed -nE 's/^MTPROXY_TAG_ARGS=-P ([0-9a-f]{32})$/\1/p' "$AD_TAG_FILE" | head -n1)"
+        [[ -n "$AD_TAG" ]] || AD_TAG=none
+        info "Найдена предыдущая установка — настройка рекламного тега сохранена."
+    else
+        AD_TAG="$AD_TAG_DEFAULT"
+    fi
+fi
+if [[ "$AD_TAG" != none && ! "$AD_TAG" =~ ^[0-9a-f]{32}$ ]]; then
+    error "--ad-tag должен состоять из 32 hex-символов (тег от @MTProxybot) или быть none"
+fi
+
 success "Домен:  $DOMAIN"
 success "Email:  $EMAIL"
 success "Secret: $SECRET"
+if [[ "$AD_TAG" == none ]]; then
+    success "Ad tag: отключён"
+else
+    success "Ad tag: $AD_TAG"
+fi
 
 #------------------------------------------------------------------------------
 # Зависимости
@@ -235,60 +288,37 @@ fi
 #------------------------------------------------------------------------------
 step "Получение официальных исходников tproxy-server..."
 
-if [[ -d "$SRC_DIR/.git" ]]; then
-    git -C "$SRC_DIR" fetch --depth 1 origin HEAD
-    git -C "$SRC_DIR" reset --hard FETCH_HEAD
-    git -C "$SRC_DIR" clean -fdx
-else
+# Забираем ровно закреплённый коммит. checkout --force + clean -fdx возвращают
+# дерево к чистому состоянию, так что правки ниже применяются заново при каждом запуске.
+if [[ ! -d "$SRC_DIR/.git" ]]; then
     rm -rf "$SRC_DIR"
-    git clone --depth 1 "$UPSTREAM_REPO" "$SRC_DIR"
+    git init -q "$SRC_DIR"
+    git -C "$SRC_DIR" remote add origin "$UPSTREAM_REPO"
 fi
+git -C "$SRC_DIR" remote set-url origin "$UPSTREAM_REPO"
+git -C "$SRC_DIR" fetch -q --depth 1 origin "$UPSTREAM_REF"
+git -C "$SRC_DIR" checkout -q --force --detach FETCH_HEAD
+git -C "$SRC_DIR" clean -fdxq
 chmod +x "$SRC_DIR/deploy/install.sh" "$SRC_DIR/deploy/install-mtproxy.sh"
 
-# Обходной путь для бага апстрима: deploy/install.sh выставляет `umask 077`, а затем
-# запускает `go test ./...`. Тест TestLoadAcceptsSystemdCredentialReadPermissions создаёт
-# profiles.json с режимом 0444 и ждёт, что Load его отвергнет как доступный на чтение
-# группе и остальным. Под umask 077 файл получает режим 0400, Load его принимает,
-# и тест падает — установка обрывается на исправном сервере.
-# Прогоняем тесты под umask 022; на создание файлов установщиком это не влияет.
-if grep -qE '^\(cd .* test \./\.\.\.\)$' "$SRC_DIR/deploy/install.sh"; then
-    sed -i -E 's|^\(cd .* test \./\.\.\.\)$|(umask 022; &)|' "$SRC_DIR/deploy/install.sh"
-    grep -q 'umask 022; (cd' "$SRC_DIR/deploy/install.sh" ||
-        error "Не удалось применить обходной путь для тестов апстрима"
-    success "Применён обходной путь для umask в тестах апстрима"
+# Рекламный тег. Официальный mtproxy.service его не поддерживает, поэтому добавляем
+# необязательный EnvironmentFile и переменную MTPROXY_TAG_ARGS — так же, как апстрим
+# передаёт MTPROXY_NAT_ARGS: без кавычек, пустое значение не даёт ни одного аргумента.
+# Файл с тегом лежит отдельно от mtproxy.env, который апстрим перезаписывает при
+# каждой установке, поэтому повторный запуск сохраняет выбор.
+MTPROXY_UNIT="$SRC_DIR/deploy/mtproxy.service"
+sed -i -E \
+    -e 's|^Environment=MTPROXY_NAT_ARGS=$|&\nEnvironment=MTPROXY_TAG_ARGS=\nEnvironmentFile=-'"$AD_TAG_FILE"'|' \
+    -e 's|^(ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy .*)$|\1 $MTPROXY_TAG_ARGS|' \
+    "$MTPROXY_UNIT"
+if grep -q '^ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy .* \$MTPROXY_TAG_ARGS$' "$MTPROXY_UNIT" &&
+   grep -qx "EnvironmentFile=-$AD_TAG_FILE" "$MTPROXY_UNIT"; then
+    success "mtproxy.service: добавлена поддержка рекламного тега"
+elif [[ "$AD_TAG" != none ]]; then
+    error "Формат mtproxy.service в апстриме изменился — рекламный тег не подключить.
+       Запустите с --ad-tag none или обновите install.sh."
 else
-    warn "Строка запуска тестов апстрима не найдена — обходной путь не нужен или формат изменился."
-fi
-
-# Тот же баг во второй раз: install-mtproxy.sh наследует `umask 077` от deploy/install.sh,
-# поэтому make создаёт objs/, objs/bin/ и сам бинарник с режимом 0700. Дерево затем
-# отдаётся root:root, а юнит запускает mtproto-proxy от пользователя mtproxy — тот не может
-# войти в каталог и systemd сообщает 203/EXEC. Собираем под umask 022.
-if grep -q '^umask 022$' "$SRC_DIR/deploy/install-mtproxy.sh"; then
-    :
-elif grep -q '^set -euo pipefail$' "$SRC_DIR/deploy/install-mtproxy.sh"; then
-    sed -i '/^set -euo pipefail$/a umask 022' "$SRC_DIR/deploy/install-mtproxy.sh"
-    grep -q '^umask 022$' "$SRC_DIR/deploy/install-mtproxy.sh" ||
-        error "Не удалось применить обходной путь для umask при сборке MTProxy"
-    success "Применён обходной путь для umask при сборке MTProxy"
-else
-    warn "Формат install-mtproxy.sh изменился — обходной путь для umask не применён."
-fi
-
-# Установщик пропускает пересборку, если бинарник уже на месте, поэтому дерево,
-# собранное прошлым запуском под umask 077, надо починить отдельно.
-if [[ -d /opt/MTProxy ]]; then
-    chmod -R a+rX /opt/MTProxy
-    if id -u mtproxy >/dev/null 2>&1 &&
-       ! runuser -u mtproxy -- test -x /opt/MTProxy/objs/bin/mtproto-proxy; then
-        warn "Пользователь mtproxy всё ещё не может запустить mtproto-proxy."
-        warn "Удаляем /opt/MTProxy — установщик пересоберёт его под корректным umask."
-        ls -ld /opt/MTProxy /opt/MTProxy/objs /opt/MTProxy/objs/bin \
-               /opt/MTProxy/objs/bin/mtproto-proxy 2>&1 | sed 's/^/    /' || true
-        rm -rf /opt/MTProxy
-    else
-        success "Права на /opt/MTProxy в порядке"
-    fi
+    warn "Формат mtproxy.service изменился — поддержка рекламного тега не добавлена."
 fi
 
 success "Исходники: $SRC_DIR ($(git -C "$SRC_DIR" rev-parse --short HEAD))"
@@ -365,7 +395,7 @@ else
         local slot="$1" idx badge
         idx="$(pick "$slot")"
         badge="$2"
-        printf '          <a class="card" href="/watch">\n'
+        printf '          <a class="card" href="/watch.html">\n'
         printf '            <span class="thumb tb%d">' "$(( slot % 12 ))"
         if [[ -n "$badge" ]]; then
             printf '<span class="badge-live">LIVE</span><span class="dur watching">%s watching</span>' "$badge"
@@ -388,7 +418,7 @@ else
     emit_mini() {
         local slot="$1" idx
         idx="$(pick "$slot")"
-        printf '        <a class="card mini" href="/watch">\n'
+        printf '        <a class="card mini" href="/watch.html">\n'
         printf '          <span class="thumb tb%d"><span class="dur">%s</span></span>\n' \
             "$(( slot % 12 ))" "${durs[idx]}"
         printf '          <span class="ctext"><span class="ctitle">%s</span>' "${titles[idx]}"
@@ -416,17 +446,17 @@ else
     <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9"/><path d="M13 10.4v11.2l9.2-5.6z"/></svg>
     <span class="brandname">$BRAND</span>
   </a>
-  <a class="search" href="/browse">
+  <a class="search" href="/browse.html">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M16.5 16.5 21 21"/></svg>
     <span>Search the library</span>
   </a>
-  <nav class="tnav"><a href="/browse">Browse</a><a href="/about">About</a></nav>
+  <nav class="tnav"><a href="/browse.html">Browse</a><a href="/about.html">About</a></nav>
 </header>
 <div class="shell">
   <aside class="sidebar">
     <nav>
 HEAD
-        for item in "Home:/" "Browse:/browse" "Live streams:/browse"; do
+        for item in "Home:/" "Browse:/browse.html" "Live streams:/browse.html"; do
             name="${item%%:*}"; href="${item#*:}"
             if [[ "$name" == "$active" ]]; then
                 printf '      <a class="on" href="%s">%s</a>\n' "$href" "$name"
@@ -436,13 +466,13 @@ HEAD
         done
         cat <<'HEAD2'
       <div class="sidegroup">Collections</div>
-      <a href="/browse">Field recordings</a>
-      <a href="/browse">Workshop</a>
-      <a href="/browse">Slow TV</a>
-      <a href="/browse">Studio sessions</a>
+      <a href="/browse.html">Field recordings</a>
+      <a href="/browse.html">Workshop</a>
+      <a href="/browse.html">Slow TV</a>
+      <a href="/browse.html">Studio sessions</a>
       <div class="sidegroup">Library</div>
-      <a href="/about">About</a>
-      <a href="/privacy">Privacy</a>
+      <a href="/about.html">About</a>
+      <a href="/privacy.html">Privacy</a>
     </nav>
   </aside>
   <main>
@@ -455,7 +485,7 @@ HEAD2
 </div>
 <footer class="foot"><div class="in">
   <span>&copy; $YEAR $BRAND — independent video library for $ROOTDOMAIN</span>
-  <span><a href="/about">About</a> · <a href="/privacy">Privacy</a> · <a href="/browse">Browse</a></span>
+  <span><a href="/about.html">About</a> · <a href="/privacy.html">Privacy</a> · <a href="/browse.html">Browse</a></span>
 </div></footer>
 </body>
 </html>
@@ -589,7 +619,7 @@ SVG
     <p class="lead">$BRAND publishes long-form video: field recordings, workshop
     documentaries and unedited studio sessions. Most of the library is 4K, and
     nothing here is cut down to fit a feed.</p>
-    <div class="sec"><h2>Live now</h2><a href="/browse">All streams</a></div>
+    <div class="sec"><h2>Live now</h2><a href="/browse.html">All streams</a></div>
     <div class="rail">
 INDEX
         emit_card 0 "1,204"
@@ -597,13 +627,13 @@ INDEX
         emit_card 2 "2,976"
         cat <<'INDEX2'
     </div>
-    <div class="sec"><h2>Recently added</h2><a href="/browse">Browse the library</a></div>
+    <div class="sec"><h2>Recently added</h2><a href="/browse.html">Browse the library</a></div>
     <div class="grid">
 INDEX2
         for n in 3 4 5 6 7 8 9 10; do emit_card "$n" ""; done
         cat <<'INDEX3'
     </div>
-    <div class="sec"><h2>Long-form &amp; overnight</h2><a href="/browse">More</a></div>
+    <div class="sec"><h2>Long-form &amp; overnight</h2><a href="/browse.html">More</a></div>
     <div class="grid">
 INDEX3
         for n in 11 12 13 14; do emit_card "$n" ""; done
@@ -618,13 +648,13 @@ INDEX3
     <h1>Browse the library</h1>
     <p class="lead">412 titles, 1,860 hours. Sorted by most recently added.</p>
     <div class="cats">
-      <a class="cat on" href="/browse">All</a>
-      <a class="cat" href="/browse">Field recordings</a>
-      <a class="cat" href="/browse">Workshop</a>
-      <a class="cat" href="/browse">Slow TV</a>
-      <a class="cat" href="/browse">Studio sessions</a>
-      <a class="cat" href="/browse">Live</a>
-      <a class="cat" href="/browse">4K</a>
+      <a class="cat on" href="/browse.html">All</a>
+      <a class="cat" href="/browse.html">Field recordings</a>
+      <a class="cat" href="/browse.html">Workshop</a>
+      <a class="cat" href="/browse.html">Slow TV</a>
+      <a class="cat" href="/browse.html">Studio sessions</a>
+      <a class="cat" href="/browse.html">Live</a>
+      <a class="cat" href="/browse.html">4K</a>
     </div>
     <div class="grid">
 BROWSE
@@ -737,7 +767,7 @@ PRIVACY
       <h1>That title is not here</h1>
       <p class="lead">The link may be old, or the video may have been re-published
       under a different slug. The library index is the fastest way to find it.</p>
-      <p><a class="cat" href="/browse">Browse the library</a></p>
+      <p><a class="cat" href="/browse.html">Browse the library</a></p>
     </div>
 NOTFOUND
         page_close
@@ -760,6 +790,58 @@ NOTFOUND
     warn "но для серьёзной маскировки замените /srv/tproxy-site настоящим сайтом"
 fi
 
+# Апстрим по умолчанию отдаёт только точные имена файлов (static_routes=exact):
+# ссылка /about вместо /about.html отвечает 404. Сайтам со ссылками без .html,
+# включая заглушку прошлых версий этого скрипта, нужны маршруты legacy.
+# Апстрим не перезаписывает существующий /srv/tproxy-site, поэтому смотрим на тот
+# сайт, который реально будет отдаваться.
+if [[ -z "$STATIC_ROUTES" ]]; then
+    STATIC_ROUTES=exact
+    served_site=""
+    if [[ -n "$SITE_UPSTREAM" ]]; then
+        :
+    elif [[ -f "$SITE_DIR_DEFAULT/index.html" ]]; then
+        served_site="$SITE_DIR_DEFAULT"
+    elif [[ ${#SITE_ARGS[@]} -gt 0 ]]; then
+        served_site="${SITE_ARGS[1]}"
+    fi
+    if [[ -n "$served_site" ]] &&
+       grep -rqsE --include='*.html' "href=[\"']/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+[\"'?#]" "$served_site"; then
+        STATIC_ROUTES=legacy
+        info "Сайт в $served_site ссылается на страницы без .html — включены маршруты legacy."
+    fi
+fi
+UPSTREAM_ARGS=(--static-routes "$STATIC_ROUTES")
+
+# Base path: апстрим генерирует случайный путь для новой установки и сохраняет
+# прежний при повторной. Явное значение меняет адрес прокси и ломает старые ссылки.
+OLD_BASE_PATH=""
+if [[ -f /etc/tproxy-server/config.json ]]; then
+    OLD_BASE_PATH="$(sed -n 's/.*"base_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        /etc/tproxy-server/config.json | head -n1)"
+fi
+if [[ -n "$BASE_PATH" ]]; then
+    UPSTREAM_ARGS+=(--base-path "$BASE_PATH")
+    new_base="$BASE_PATH"; [[ "$new_base" != none ]] || new_base=""
+    if [[ -f /etc/tproxy-server/config.json && "$new_base" != "$OLD_BASE_PATH" ]]; then
+        warn "Base path меняется («${OLD_BASE_PATH:-корень}» -> «${new_base:-корень}»): старые ссылки перестанут работать."
+    fi
+fi
+
+#------------------------------------------------------------------------------
+# Рекламный тег
+#------------------------------------------------------------------------------
+# Пишем до запуска апстрима: его установщик сам перезапускает mtproxy, и тег сразу
+# попадает в командную строку. Пустое значение тоже сохраняется — как явный отказ.
+[[ -d /etc/mtproxy ]] || install -d -m 0750 /etc/mtproxy
+if [[ "$AD_TAG" == none ]]; then
+    printf 'MTPROXY_TAG_ARGS=\n' > "$AD_TAG_FILE.tmp"
+else
+    printf 'MTPROXY_TAG_ARGS=-P %s\n' "$AD_TAG" > "$AD_TAG_FILE.tmp"
+fi
+chmod 0600 "$AD_TAG_FILE.tmp"
+mv -f "$AD_TAG_FILE.tmp" "$AD_TAG_FILE"
+
 #------------------------------------------------------------------------------
 # Официальный установщик
 #------------------------------------------------------------------------------
@@ -773,6 +855,7 @@ printf '%s\n' "$SECRET" | "$SRC_DIR/deploy/install.sh" \
     --email "$EMAIL" \
     --mtproxy-workers "$WORKERS" \
     --mtproxy-max-connections "$MAX_CONNECTIONS" \
+    "${UPSTREAM_ARGS[@]}" \
     ${SITE_ARGS[@]+"${SITE_ARGS[@]}"}
 
 #------------------------------------------------------------------------------
@@ -796,8 +879,28 @@ done
 [[ ${#failed[@]} -eq 0 ]] || error "Не запустились сервисы: ${failed[*]}
        Логи: journalctl -u ${failed[0]} -n 50 --no-pager"
 
-if curl -fsS --max-time 10 http://127.0.0.1:8081/readyz >/dev/null; then
+relay_ready=""
+for _ in $(seq 1 20); do
+    if curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:8081/readyz 2>/dev/null; then relay_ready=1; break; fi
+    sleep 1
+done
+if [[ -n "$relay_ready" ]]; then
     success "Релей готов (127.0.0.1:8081/readyz)"
+else
+    warn "/readyz не отвечает: релей не достучался до MTProxy. journalctl -u mtproxy -n 50 --no-pager"
+fi
+
+if [[ "$AD_TAG" != none ]]; then
+    mt_pid="$(systemctl show -p MainPID --value mtproxy.service 2>/dev/null || true)"
+    mt_cmd=""
+    if [[ "$mt_pid" =~ ^[1-9][0-9]*$ ]]; then
+        mt_cmd="$(tr '\0' ' ' < "/proc/$mt_pid/cmdline" 2>/dev/null || true)"
+    fi
+    if [[ "$mt_cmd" == *" -P $AD_TAG"* ]]; then
+        success "MTProxy запущен с рекламным тегом $AD_TAG"
+    else
+        warn "MTProxy запущен без рекламного тега. Проверьте: systemctl cat mtproxy; cat $AD_TAG_FILE"
+    fi
 fi
 
 echo -e "${BLUE}[*] Ожидание выпуска TLS-сертификата Let's Encrypt...${RESET}"
@@ -816,6 +919,39 @@ fi
 #------------------------------------------------------------------------------
 # Итог
 #------------------------------------------------------------------------------
+# Адрес и секрет для клиента зависят от base path (README/BASE_PATH.md апстрима):
+#   корень    : сервер = домен,          секрет = hex как есть;
+#   base path : сервер = домен/путь,     секрет = base64url(0x70 || secret) без '='.
+# Клиент выводит из этой пары capability моста; с голым доменом и hex-секретом
+# под base path он получает обычный сайт и не подключается.
+BASE_PATH_FINAL="$(sed -n 's/.*"base_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    /etc/tproxy-server/config.json | head -n1)"
+web_proxy_secret() {
+    if [[ -z "$BASE_PATH_FINAL" ]]; then
+        printf %s "$SECRET"
+        return
+    fi
+    # Как в deploy/install.sh: сырые байты только в конвейере, не в переменной (NUL).
+    {
+        printf '\x70'
+        printf "$(printf %s "$SECRET" | sed 's/../\\x&/g')"
+    } | base64 | tr '+/' '-_' | tr -d '=\n'
+}
+CLIENT_SERVER="$DOMAIN"
+[[ -z "$BASE_PATH_FINAL" ]] || CLIENT_SERVER="$DOMAIN/$BASE_PATH_FINAL"
+CLIENT_SECRET="$(web_proxy_secret)"
+LINK_QUERY="server=${CLIENT_SERVER//\//%2F}&secret=$CLIENT_SECRET"
+SECRET_NOTE=""
+if [[ "$CLIENT_SECRET" != "$SECRET" ]]; then
+    SECRET_NOTE="(в клиент его не вводить — там нужен Proxy secret выше)
+"
+fi
+if [[ "$AD_TAG" == none ]]; then
+    AD_TAG_LINE="отключён (включить: --ad-tag <тег от @MTProxybot>)"
+else
+    AD_TAG_LINE="$AD_TAG (сменить: --ad-tag <тег>, отключить: --ad-tag none)"
+fi
+
 install -m 0600 /dev/null "$INFO_FILE"
 cat > "$INFO_FILE" <<EOF
 ========================================
@@ -829,12 +965,16 @@ cat > "$INFO_FILE" <<EOF
 - nftables (закрывает порты 2398 и 8888 снаружи)
 
 Параметры для клиента Telegram (тип прокси: WEB):
-Hostname: $DOMAIN
-Secret:   $SECRET
+Proxy server: $CLIENT_SERVER
+Proxy secret: $CLIENT_SECRET
 
 Ссылка для подключения:
-https://t.me/webproxy?server=$DOMAIN&secret=$SECRET
-tg://webproxy?server=$DOMAIN&secret=$SECRET
+https://t.me/webproxy?$LINK_QUERY
+tg://webproxy?$LINK_QUERY
+
+Внутренний секрет MTProxy: $SECRET
+$SECRET_NOTE
+Рекламный тег: $AD_TAG_LINE
 
 Полезные команды:
 systemctl --no-pager --full status caddy tproxy-firewall mtproxy tproxy-server
@@ -843,7 +983,7 @@ curl --fail http://127.0.0.1:8081/readyz
 
 Сайт-заглушка: /srv/tproxy-site (после правок: systemctl restart tproxy-server)
 Исходники:     $SRC_DIR
-Переустановка: bash install.sh $DOMAIN   (секрет сохранится)
+Переустановка: bash install.sh $DOMAIN   (секрет, base path и тег сохранятся)
 EOF
 chmod 0600 "$INFO_FILE"
 
